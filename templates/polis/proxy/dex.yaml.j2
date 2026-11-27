@@ -1,0 +1,29 @@
+issuer: https://{{ polis_domain }}/identity
+storage:
+  type: sqlite3
+  config:
+    file: /var/dex/polis.db
+web:
+  http: 0.0.0.0:5556
+oauth2:
+  skipApprovalScreen: true
+  grantTypes: [authorization_code]
+  responseTypes: [code]
+  pkce:
+    enforce: true
+    codeChallengeMethodsSupported: [S256]
+staticClients:
+  - id: polis
+    name: Polis
+    public: true
+    redirectURIs:
+      - https://{{ polis_domain }}
+      - https://{{ polis_domain }}/
+    postLogoutRedirectURIs:
+      - https://{{ polis_domain }}/home2
+connectors:
+  - type: authproxy
+    id: entrance
+    name: Google
+    config:
+      userHeader: X-Remote-User

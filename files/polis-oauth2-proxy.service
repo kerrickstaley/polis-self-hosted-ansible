@@ -1,0 +1,23 @@
+[Unit]
+Description=Polis OAuth2 Proxy
+After=network-online.target
+Wants=network-online.target
+ConditionFileNotEmpty=/etc/oauth2-proxy/credentials/google.env
+ConditionFileNotEmpty=/etc/oauth2-proxy/credentials/google-client-secret
+
+[Service]
+DynamicUser=yes
+SupplementaryGroups=polis-ingress
+EnvironmentFile=/etc/oauth2-proxy/credentials/google.env
+LoadCredential=google-client-secret:/etc/oauth2-proxy/credentials/google-client-secret
+LoadCredential=cookie-secret:/etc/oauth2-proxy/credentials/cookie-secret
+LoadCredential=allowed-emails:/etc/oauth2-proxy/credentials/allowed-emails
+Environment=OAUTH2_PROXY_CLIENT_SECRET_FILE=%d/google-client-secret
+Environment=OAUTH2_PROXY_COOKIE_SECRET_FILE=%d/cookie-secret
+Environment=OAUTH2_PROXY_AUTHENTICATED_EMAILS_FILE=%d/allowed-emails
+ExecStartPre=/usr/local/bin/oauth2-proxy --config=/etc/oauth2-proxy/polis.cfg --config-test
+ExecStart=/usr/local/bin/oauth2-proxy --config=/etc/oauth2-proxy/polis.cfg
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

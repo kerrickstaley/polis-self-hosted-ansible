@@ -1,0 +1,15 @@
+provider = "google"
+scope = "openid email profile"
+redirect_url = "https://{{ polis_domain }}/oauth2/callback"
+code_challenge_method = "S256"
+skip_provider_button = true
+pass_basic_auth = false
+
+http_address = "127.0.0.1:4180"
+reverse_proxy = true
+trusted_proxy_ips = ["127.0.0.1/32"]
+upstreams = ["unix:///opt/polis/ingress/polis.sock"]
+
+cookie_name = "__Host-polis_oauth2"
+cookie_secure = true
+cookie_samesite = "lax"

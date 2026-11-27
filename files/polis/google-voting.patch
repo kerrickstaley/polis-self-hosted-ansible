@@ -1,0 +1,449 @@
+diff --git a/client-admin/src/index.js b/client-admin/src/index.js
+index 03b55bc..2ea0d76 100644
+--- a/client-admin/src/index.js
++++ b/client-admin/src/index.js
+@@ -36,10 +36,19 @@ const OidcProvider = ({ children }) => {
+     client_id: clientId,
+     redirect_uri: redirectUri,
+     post_logout_redirect_uri: `${redirectUri}/home2`,
+-    scope: 'openid profile email',
+-    userStore: new WebStorageStateStore({ store: window.localStorage }),
++    scope: 'openid profile email federated:id',
++    userStore: new WebStorageStateStore({ store: window.localStorage, prefix: 'polis.google.' }),
+     extraQueryParams: { audience },
+     onSigninCallback: (user) => {
++      const voterPage = sessionStorage.getItem('polis.voterReturnTo')
++      if (voterPage) {
++        sessionStorage.removeItem('polis.voterReturnTo')
++        const target = new URL(voterPage, window.location.origin)
++        if (target.origin === window.location.origin) {
++          window.location.replace(target.href)
++          return
++        }
++      }
+       navigate(user?.state?.returnTo || window.location.pathname)
+     }
+   }
+diff --git a/client-participation-alpha/src/env.d.ts b/client-participation-alpha/src/env.d.ts
+index 3ea4f4e..f1b49dd 100644
+--- a/client-participation-alpha/src/env.d.ts
++++ b/client-participation-alpha/src/env.d.ts
+@@ -1,5 +1,9 @@
+ /// <reference types="astro/client" />
+ 
++interface Window {
++  polisVoterToken?: () => string | null
++}
++
+ interface ImportMetaEnv {
+   readonly PUBLIC_SERVICE_URL: string
+   readonly PUBLIC_OIDC_CACHE_KEY_PREFIX: string
+diff --git a/client-participation-alpha/src/lib/auth.ts b/client-participation-alpha/src/lib/auth.ts
+index 90257a6..164d8f9 100644
+--- a/client-participation-alpha/src/lib/auth.ts
++++ b/client-participation-alpha/src/lib/auth.ts
+@@ -130,6 +130,10 @@ export function getConversationToken(conversation_id: string) {
+   if (typeof window === 'undefined') {
+     return null
+   }
++  if (window.polisVoterToken) {
++    const token = window.polisVoterToken()
++    return token ? { token } : null
++  }
+   const tokenKey = `participant_token_${conversation_id}`
+   const rawToken = localStorage.getItem(tokenKey)
+ 
+diff --git a/client-participation-alpha/src/pages/[conversation_id].astro b/client-participation-alpha/src/pages/[conversation_id].astro
+index 0513d98..356083e 100644
+--- a/client-participation-alpha/src/pages/[conversation_id].astro
++++ b/client-participation-alpha/src/pages/[conversation_id].astro
+@@ -116,6 +116,7 @@ const hideHeader = Astro.url.searchParams.get('hide_header');
+   lang={pageLang || 'en'}
+   dir={s.direction}
+ >
++  <script is:inline src="/polis-voter.js"></script>
+   <style is:global>
+     html[data-polis-returning] [data-initial-statement] { visibility: hidden; }
+   </style>
+diff --git a/client-participation/js/util/polisStorage.js b/client-participation/js/util/polisStorage.js
+index 183c328..679ff20 100644
+--- a/client-participation/js/util/polisStorage.js
++++ b/client-participation/js/util/polisStorage.js
+@@ -101,6 +101,7 @@ function userCreated() {
+ 
+ // JWT token management functions
+ function getJwtToken() {
++  if (window.polisVoterToken) return window.polisVoterToken();
+   try {
+     var conversationId = _getConversationIdFromUrl();
+     var token = null;
+diff --git a/client-participation/public/index.ejs b/client-participation/public/index.ejs
+index e8eed9f..59dfbf7 100644
+--- a/client-participation/public/index.ejs
++++ b/client-participation/public/index.ejs
+@@ -2,6 +2,7 @@
+ <html lang="en">
+   <head>
+     <meta charset="utf-8">
++    <script src="/polis-voter.js"></script>
+     <script><%= clientErrorPrelude %></script>
+     <meta name="viewport" content="width=device-width, initial-scale=1">
+     <title>Polis</title>
+@@ -216,20 +217,7 @@
+           
+           // Add JWT token to request if available
+           try {
+-            var token = null;
+-            var conversationId = getConversationIdFromPath();
+-            if (conversationId) {
+-              var tokenKey = "participant_token_" + conversationId;
+-              if (window.localStorage) {
+-                token = window.localStorage.getItem(tokenKey);
+-              }
+-              if (!token && window.sessionStorage) {
+-                token = window.sessionStorage.getItem(tokenKey);
+-              }
+-            }
+-            if (!token) {
+-              token = getOidcToken();
+-            }
++            var token = window.polisVoterToken();
+             if (token) {
+               xmlhttp.setRequestHeader('Authorization', 'Bearer ' + token);
+             }
+diff --git a/server/app.ts b/server/app.ts
+index 1d4a403..10f636a 100644
+--- a/server/app.ts
++++ b/server/app.ts
+@@ -32,7 +32,7 @@ import {
+ } from "./src/server-middleware";
+ 
+ import { handle_GET_conversationUuid } from "./src/routes/conversationUuid";
+-import { jwtValidation } from "./src/auth/jwt-middleware";
++import { extractUserFromJWT, jwtValidation } from "./src/auth/jwt-middleware";
+ import { createOpsRoutes } from "./src/routes/ops";
+ import { handle_GET_xidReport } from "./src/routes/export";
+ import {
+@@ -692,14 +692,13 @@ export const appReady = helpersInitialized.then(
+     app.post(
+       "/api/v3/comments",
+       onParticipationPools,
+-      hybridAuthOptional(assignToP),
++      jwtValidation,
++      extractUserFromJWT(assignToP),
+       need(
+         "conversation_id",
+         getConversationIdFetchZid,
+         assignToPCustom("zid")
+       ),
+-      // Process XID before ensureParticipant
+-      want("xid", getStringLimitLength(1, 999), assignToP),
+       ensureParticipant({ createIfMissing: true, issueJWT: true }),
+       need("txt", getStringLimitLength(1, 997), assignToP),
+       want("vote", getIntInRange(WIRE_VOTE_MIN, WIRE_VOTE_MAX), assignToP),
+@@ -1173,14 +1172,13 @@ export const appReady = helpersInitialized.then(
+     app.post(
+       "/api/v3/votes",
+       onParticipationPools,
+-      hybridAuthOptional(assignToP),
++      jwtValidation,
++      extractUserFromJWT(assignToP),
+       need(
+         "conversation_id",
+         getConversationIdFetchZid,
+         assignToPCustom("zid")
+       ),
+-      // Process XID before ensureParticipant
+-      want("xid", getStringLimitLength(1, 999), assignToP),
+       ensureParticipant({ createIfMissing: true, issueJWT: true }),
+       need("tid", getInt, assignToP),
+       need("vote", getIntInRange(WIRE_VOTE_MIN, WIRE_VOTE_MAX), assignToP),
+diff --git a/server/src/auth/create-user.ts b/server/src/auth/create-user.ts
+index 32b9bd9..b4f4896 100644
+--- a/server/src/auth/create-user.ts
++++ b/server/src/auth/create-user.ts
+@@ -50,12 +50,8 @@ async function createAnonUser(): Promise<number> {
+  */
+ async function getOrCreateUserIDFromOidcSub(
+   oidcSub: string,
+-  oidcUser: any,
+-  retryCount = 0
++  oidcUser: any
+ ): Promise<number> {
+-  const maxRetries = 3;
+-  const retryDelay = 100 + Math.random() * 200; // 100-300ms jitter
+-
+   // Extract email from either standard claims or custom namespace claims
+   const namespace = Config.authNamespace;
+   const email = oidcUser.email || oidcUser[`${namespace}email`];
+@@ -74,213 +70,33 @@ async function getOrCreateUserIDFromOidcSub(
+   const displayName = name || oidcUser.nickname || email.split("@")[0];
+   const username = oidcUser.nickname || email.split("@")[0];
+ 
+-  // Use a single transaction to handle the entire user creation/mapping process
+-  // This prevents race conditions by ensuring atomicity
+-  try {
+-    const result = await pg.withTransaction(async (client) => {
+-      const mapping = await client.query(
+-        "SELECT uid FROM oidc_user_mappings WHERE oidc_sub = $1",
+-        [oidcSub]
+-      );
+-      if (mapping.rows.length > 0) return mapping.rows[0].uid;
+-
+-      const user = await client.query(
+-        `INSERT INTO users (email, hname, username, is_owner, created)
+-         VALUES ($1, $2, $3, $4, now_as_millis())
+-         ON CONFLICT (email) DO UPDATE SET
+-           hname = EXCLUDED.hname,
+-           username = EXCLUDED.username
+-         RETURNING uid`,
+-        [email, displayName, username, true]
+-      );
+-      if (!user.rows.length) throw new Error("Failed to create or find user");
+-      const uid = user.rows[0].uid;
+-      const existingMapping = await client.query(
+-        "SELECT oidc_sub FROM oidc_user_mappings WHERE uid = $1",
+-        [uid]
+-      );
+-      if (existingMapping.rows.length > 0) {
+-        const existingOidcSub = existingMapping.rows[0].oidc_sub;
+-        if (existingOidcSub === oidcSub) {
+-          logger.info(`Mapping already exists for OIDC sub ${oidcSub}: uid ${uid}`);
+-          return uid;
+-        }
+-        // Preserve the existing policy: a new social login for this email wins.
+-        logger.warn(
+-          `Local user ${uid} (${email}) was mapped to old OIDC sub ${existingOidcSub}. Overwriting with new mapping for ${oidcSub}.`
+-        );
+-        await client.query(
+-          "DELETE FROM oidc_user_mappings WHERE oidc_sub = $1 OR uid = $2",
+-          [oidcSub, uid]
+-        );
+-        await client.query(
+-          "INSERT INTO oidc_user_mappings (oidc_sub, uid, created) VALUES ($1, $2, now_as_millis())",
+-          [oidcSub, uid]
+-        );
+-      } else {
+-        await client.query(
+-          "INSERT INTO oidc_user_mappings (oidc_sub, uid, created) VALUES ($1, $2, now_as_millis()) ON CONFLICT (oidc_sub) DO NOTHING",
+-          [oidcSub, uid]
+-        );
+-      }
+-      return uid;
+-    });
+-
+-    return result;
+-  } catch (error: any) {
+-    logger.error(
+-      `Failed to get or create user for OIDC sub ${oidcSub}:`,
+-      error
++  return pg.withTransaction(async (client) => {
++    // Serialize first login across devices, including a concurrent email change.
++    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [oidcSub]);
++    const mapping = await client.query(
++      "SELECT uid, email FROM oidc_user_mappings JOIN users USING (uid) WHERE oidc_sub = $1",
++      [oidcSub]
+     );
+-
+-    // Handle specific constraint violations with retry logic
+-    if (error.code === "23505") {
+-      // Handle oidc_user_mappings primary key constraint violation
+-      if (error.constraint === "oidc_user_mappings_pkey") {
+-        if (retryCount < maxRetries) {
+-          logger.warn(
+-            `OIDC mapping constraint violation (attempt ${retryCount + 1}/${
+-              maxRetries + 1
+-            }), retrying after ${retryDelay}ms for sub: ${oidcSub}`
+-          );
+-
+-          // Wait with jitter to reduce collision probability
+-          await new Promise((resolve) => setTimeout(resolve, retryDelay));
+-
+-          // Retry with incremented count
+-          return getOrCreateUserIDFromOidcSub(
+-            oidcSub,
+-            oidcUser,
+-            retryCount + 1
+-          );
+-        } else {
+-          // Max retries exceeded, try to find existing mapping
+-          logger.error(
+-            `Max retries exceeded for OIDC sub ${oidcSub}, attempting final lookup`
+-          );
+-
+-          try {
+-            const finalResult = await new Promise<number>((resolve, reject) => {
+-              pg.query_readOnly(
+-                "SELECT uid FROM oidc_user_mappings WHERE oidc_sub = $1",
+-                [oidcSub],
+-                (err: any, results: { rows: any[] }) => {
+-                  if (err) return reject(err);
+-                  if (!results.rows.length) {
+-                    return reject(
+-                      new Error(
+-                        `OIDC mapping not found after retries for sub: ${oidcSub}`
+-                      )
+-                    );
+-                  }
+-                  logger.info(
+-                    `Found existing mapping after retries for OIDC sub ${oidcSub}: uid ${results.rows[0].uid}`
+-                  );
+-                  resolve(results.rows[0].uid);
+-                }
+-              );
+-            });
+-            return finalResult;
+-          } catch (lookupError) {
+-            logger.error(
+-              `Final lookup failed for OIDC sub ${oidcSub}:`,
+-              lookupError
+-            );
+-            throw new Error(
+-              `Unable to create or find user mapping for OIDC sub: ${oidcSub}. This may be due to high concurrency. Please try again.`
+-            );
+-          }
+-        }
+-      }
+-
+-      // Handle other constraint violations (users_email_key, oidc_user_mappings_uid_key)
+-      else if (
+-        error.constraint === "users_email_key" ||
+-        error.constraint === "oidc_user_mappings_uid_key"
+-      ) {
+-        logger.warn(
+-          `Constraint violation detected for ${email}, attempting recovery...`
+-        );
+-
+-        try {
+-          // Try to find the existing user and handle mapping conflicts
+-          const recoveryResult = await new Promise<number>(
+-            (resolve, reject) => {
+-              pg.query_readOnly(
+-                "SELECT uid FROM users WHERE LOWER(email) = LOWER($1)",
+-                [email],
+-                (err: any, results: { rows: any[] }) => {
+-                  if (err) return reject(err);
+-                  if (!results.rows.length) {
+-                    return reject(
+-                      new Error(
+-                        `User with email ${email} not found during recovery`
+-                      )
+-                    );
+-                  }
+-
+-                  const uid = results.rows[0].uid;
+-
+-                  // Check if there's already a mapping for this uid
+-                  pg.query_readOnly(
+-                    "SELECT oidc_sub FROM oidc_user_mappings WHERE uid = $1",
+-                    [uid],
+-                    (
+-                      mappingCheckErr: any,
+-                      mappingCheckResult: { rows: any[] }
+-                    ) => {
+-                      if (mappingCheckErr) return reject(mappingCheckErr);
+-
+-                      if (mappingCheckResult.rows.length > 0) {
+-                        const existingOidcSub =
+-                          mappingCheckResult.rows[0].oidc_sub;
+-                        if (existingOidcSub === oidcSub) {
+-                          // Mapping already exists for this oidc_sub
+-                          logger.info(
+-                            `Recovery: mapping already exists for OIDC sub ${oidcSub}: uid ${uid}`
+-                          );
+-                          resolve(uid);
+-                        } else {
+-                          // Different mapping exists - this is expected with test data
+-                          logger.warn(
+-                            `Recovery: uid ${uid} already mapped to ${existingOidcSub}, not creating new mapping for ${oidcSub}`
+-                          );
+-                          resolve(uid);
+-                        }
+-                      } else {
+-                        // No mapping exists, create one
+-                        pg.query(
+-                          "INSERT INTO oidc_user_mappings (oidc_sub, uid, created) VALUES ($1, $2, now_as_millis()) ON CONFLICT (oidc_sub) DO NOTHING",
+-                          [oidcSub, uid],
+-                          (mappingErr: any) => {
+-                            if (mappingErr) return reject(mappingErr);
+-                            logger.info(
+-                              `Recovery successful: linked existing user ${uid} to OIDC sub ${oidcSub}`
+-                            );
+-                            resolve(uid);
+-                          }
+-                        );
+-                      }
+-                    }
+-                  );
+-                }
+-              );
+-            }
+-          );
+-
+-          return recoveryResult;
+-        } catch (recoveryError) {
+-          logger.error("Recovery attempt failed:", recoveryError);
+-          throw new Error(
+-            `Unable to create or find user for email: ${email}. Original error: ${error.message}, Recovery error: ${recoveryError}`
+-          );
+-        }
++    if (mapping.rows.length) {
++      const { uid, email: storedEmail } = mapping.rows[0];
++      if (storedEmail !== email) {
++        await client.query("UPDATE users SET email = $2 WHERE uid = $1", [uid, email]);
+       }
++      return uid;
+     }
+ 
+-    // Re-throw other errors
+-    throw error;
+-  }
++    const user = await client.query(
++      `INSERT INTO users (email, hname, username, is_owner, created)
++       VALUES ($1, $2, $3, true, now_as_millis()) RETURNING uid`,
++      [email, displayName, username]
++    );
++    const uid = user.rows[0].uid;
++    await client.query(
++      "INSERT INTO oidc_user_mappings (oidc_sub, uid, created) VALUES ($1, $2, now_as_millis())",
++      [oidcSub, uid]
++    );
++    return uid;
++  });
+ }
+ 
+ export {
+diff --git a/server/src/auth/jwt-middleware.ts b/server/src/auth/jwt-middleware.ts
+index 01a1c04..92c7fc6 100644
+--- a/server/src/auth/jwt-middleware.ts
++++ b/server/src/auth/jwt-middleware.ts
+@@ -69,7 +69,14 @@ const extractUserFromJWT = (
+       // The express-jwt middleware now adds the decoded token to req.jwtPayload instead of req.auth
+       if (req.jwtPayload) {
+         // Map OIDC sub to local user ID
+-        const oidcSub = req.jwtPayload.sub;
++        const { sub: oidcSub, email, email_verified, federated_claims } = req.jwtPayload;
++        // Match the signed Dex identity to the Google session at the private gateway.
++        if (!oidcSub || !email || email_verified !== true ||
++            email !== req.headers["x-polis-google-email"] ||
++            federated_claims?.connector_id !== "entrance" || !federated_claims.user_id ||
++            federated_claims.user_id !== req.headers["x-polis-google-sub"]) {
++          return res.status(403).json({ error: "google_identity_required" });
++        }
+ 
+         try {
+           const localUid = await getOrCreateUserIDFromOidcSub(
+diff --git a/server/src/routes/users.ts b/server/src/routes/users.ts
+index 7167ad8..2b8cccd 100644
+--- a/server/src/routes/users.ts
++++ b/server/src/routes/users.ts
+@@ -89,7 +89,8 @@ async function handle_PUT_users(
+ 
+   const fields: UserType = {};
+   if (email !== undefined) {
+-    fields.email = email;
++    failJson(res, 400, "Email is managed by Google login");
++    return;
+   }
+   if (hname !== undefined) {
+     fields.hname = hname;

@@ -1,0 +1,448 @@
+---
+- name: Set up Polis VPS
+  hosts: polis
+  become: true
+  pre_tasks:
+    - name: Validate the public domain and initial allowlist address
+      ansible.builtin.assert:
+        that:
+          - polis_domain is match('^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?[.])+[a-z]{2,63}\Z')
+          - polis_initial_email is match('^[^@\s]+@[^@\s]+[.][^@\s]+\Z')
+        fail_msg: Set polis_domain and polis_initial_email in inventory.ini.
+      tags: [always]
+
+  tasks:
+    - name: Install host dependencies
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - ca-certificates
+          - git
+          - openssl
+          - unattended-upgrades
+          - certbot
+        state: present
+        update_cache: true
+
+    - name: Upgrade APT packages
+      ansible.builtin.apt:
+        upgrade: safe
+
+    - name: Create the ACME challenge webroot
+      ansible.builtin.file:
+        path: /var/www/letsencrypt
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check for the Polis certificate
+      ansible.builtin.stat:
+        path: /etc/letsencrypt/live/{{ polis_domain }}/fullchain.pem
+        follow: true
+      register: polis_certificate
+
+    - name: Install the Polis HTTP site
+      ansible.builtin.template:
+        src: polis-nginx-http.conf.j2
+        dest: /etc/nginx/sites-available/polis
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Apply nginx configuration
+
+    - name: Enable the Polis HTTP site as the default
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/polis
+        dest: /etc/nginx/sites-enabled/default
+        state: link
+      notify: Apply nginx configuration
+
+    - name: Disable the Polis HTTPS site until its certificate exists
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/polis-https
+        state: absent
+      when: not polis_certificate.stat.exists
+      notify: Apply nginx configuration
+
+    - name: Enable and start nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        enabled: true
+        state: started
+
+    - name: Bootstrap the Polis HTTPS site
+      when: not polis_certificate.stat.exists
+      block:
+        - name: Serve the ACME challenge before certificate issuance
+          ansible.builtin.meta: flush_handlers
+
+        - name: Obtain the initial Let's Encrypt certificate
+          ansible.builtin.command:
+            argv:
+              - /usr/bin/certbot
+              - certonly
+              - --non-interactive
+              - --agree-tos
+              - --register-unsafely-without-email
+              - --webroot
+              - --webroot-path
+              - /var/www/letsencrypt
+              - --cert-name
+              - "{{ polis_domain }}"
+              - --domains
+              - "{{ polis_domain }}"
+            creates: /etc/letsencrypt/live/{{ polis_domain }}/fullchain.pem
+
+    - name: Deploy Polis
+      tags: [polis_app]
+      block:
+        - name: Install the Polis container runtime
+          ansible.builtin.apt:
+            name: [docker.io, docker-compose-v2, docker-buildx]
+            state: present
+
+        - name: Start Docker
+          ansible.builtin.systemd_service:
+            name: docker
+            enabled: true
+            state: started
+
+        - name: Create the Polis deployment directory
+          ansible.builtin.file:
+            path: /opt/polis
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: Fetch the Polis source archive
+          ansible.builtin.get_url:
+            url: https://api.github.com/repos/compdemocracy/polis/tarball/f20c354ccbacbda87145dfa22807f5822a5b505d
+            checksum: sha256:ea59ce2e97ec544be784b93a1debfdcf5676f774c78f2f03cf287c06cbf1ed05
+            dest: /var/cache/polis-v2.47.2.tar.gz
+            mode: "0644"
+
+        - name: Extract the pinned Polis release
+          ansible.builtin.unarchive:
+            src: /var/cache/polis-v2.47.2.tar.gz
+            remote_src: true
+            dest: /opt/polis
+            creates: /opt/polis/compdemocracy-polis-f20c354/VERSION
+
+        - name: Install the Polis deployment files
+          ansible.builtin.copy:
+            src: files/polis/
+            dest: /opt/polis/
+            owner: root
+            group: root
+            mode: "0644"
+            directory_mode: "0755"
+
+        - name: Configure the Polis containers
+          ansible.builtin.template:
+            src: "polis/{{ item }}.j2"
+            dest: "/opt/polis/{{ item }}"
+            owner: root
+            group: root
+            mode: "0644"
+          loop:
+            - compose.yaml
+            - proxy/dex.yaml
+            - proxy/gateway.conf
+
+        - name: Create the Polis application secrets on the host
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              umask 077
+              temp=$(mktemp /opt/polis/.secrets.XXXXXX)
+              trap 'rm -f "$temp"' EXIT
+              for key in POSTGRES_PASSWORD APP_PASSWORD LOGIN_CODE_PEPPER ENCRYPTION_PASSWORD; do
+                value=$(openssl rand -hex 32)
+                printf '%s=%s\n' "$key" "$value"
+              done > "$temp"
+              ln "$temp" /opt/polis/.env
+            creates: /opt/polis/.env
+
+        - name: Create the Polis signing key directory
+          ansible.builtin.file:
+            path: /opt/polis/keys
+            state: directory
+            mode: "0700"
+
+        - name: Generate the Polis participant signing key
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              umask 077
+              temp=$(mktemp /opt/polis/keys/.key.XXXXXX)
+              trap 'rm -f "$temp"' EXIT
+              openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$temp"
+              ln "$temp" /opt/polis/keys/private.pem
+            creates: /opt/polis/keys/private.pem
+
+        - name: Export the Polis participant public key
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              temp=$(mktemp /opt/polis/keys/.pub.XXXXXX)
+              trap 'rm -f "$temp"' EXIT
+              openssl pkey -in /opt/polis/keys/private.pem -pubout -out "$temp"
+              ln "$temp" /opt/polis/keys/public.pem
+            creates: /opt/polis/keys/public.pem
+
+        - name: Create the Polis ingress group
+          ansible.builtin.group:
+            name: polis-ingress
+            system: true
+
+        - name: Restrict the socket directory to the Polis entrance
+          ansible.builtin.file:
+            path: /opt/polis/ingress
+            state: directory
+            owner: root
+            group: polis-ingress
+            mode: "0750"
+
+        - name: Remove the upstream analytics tags from the Polis pages
+          ansible.builtin.replace:
+            path: "/opt/polis/compdemocracy-polis-f20c354/{{ item }}"
+            regexp: '(?s)<script\s+data-collect-dnt="true"\s+async\s+src="https://scripts\.simpleanalyticscdn\.com/latest\.js"></script>\s*<noscript\s*>.*?</noscript>'
+            replace: ""
+          loop:
+            - client-admin/public/index.html
+            - client-participation/public/index.ejs
+            - client-report/public/index.html
+
+        - name: Apply the Polis authentication patches
+          ansible.builtin.shell:
+            chdir: /opt/polis/compdemocracy-polis-f20c354
+            cmd: |
+              set -eu
+              patch_file=../{{ item }}
+              if git apply --reverse --check "$patch_file" 2>/dev/null; then
+                exit 0
+              fi
+              git apply "$patch_file"
+              echo applied
+          register: polis_login_patch
+          changed_when: polis_login_patch.stdout == 'applied'
+          loop:
+            - oauth2-login.patch
+            - google-voting.patch
+
+        - name: Build and start the isolated Polis containers
+          ansible.builtin.command:
+            cmd: docker compose --parallel 1 up --build --detach --wait --wait-timeout 600
+            chdir: /opt/polis
+          environment:
+            COMPOSE_BAKE: "false"
+          register: polis_build
+          changed_when: "' Started' in polis_build.stderr or ' Recreated' in polis_build.stderr"
+
+        - name: Check Polis and its database through the private socket
+          ansible.builtin.uri:
+            unix_socket: /opt/polis/ingress/polis.sock
+            url: http://localhost/api/v3/testDatabase
+            use_proxy: false
+          register: polis_api_health
+          until: polis_api_health.status == 200
+          retries: 20
+          delay: 3
+
+    - name: Set up OAuth2 Proxy
+      tags: [polis_oauth2]
+      block:
+        - name: Install the OAuth2 Proxy release
+          vars:
+            polis_oauth2_release: oauth2-proxy-v7.15.6.linux-amd64
+          block:
+            - name: Download OAuth2 Proxy
+              ansible.builtin.get_url:
+                url: "https://github.com/oauth2-proxy/oauth2-proxy/releases/download/v7.15.6/{{ polis_oauth2_release }}.tar.gz"
+                checksum: sha256:91b3e86d9c2de679a516e6696704e3fd1acf67e8b8f7be77b618f086f72fb1f0
+                dest: "/var/cache/{{ polis_oauth2_release }}.tar.gz"
+                owner: root
+                group: root
+                mode: "0644"
+
+            - name: Extract OAuth2 Proxy
+              ansible.builtin.unarchive:
+                src: "/var/cache/{{ polis_oauth2_release }}.tar.gz"
+                dest: /opt
+                remote_src: true
+                owner: root
+                group: root
+                creates: "/opt/{{ polis_oauth2_release }}/oauth2-proxy"
+
+            - name: Link OAuth2 Proxy into PATH
+              ansible.builtin.file:
+                src: "/opt/{{ polis_oauth2_release }}/oauth2-proxy"
+                dest: /usr/local/bin/oauth2-proxy
+                state: link
+              notify: Restart Polis OAuth2 Proxy
+
+        - name: Create the OAuth2 Proxy directories
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "{{ item.mode }}"
+          loop:
+            - path: /etc/oauth2-proxy
+              mode: "0755"
+            - path: /etc/oauth2-proxy/credentials
+              mode: "0700"
+
+        - name: Generate the OAuth2 Proxy cookie secret on Polis
+          ansible.builtin.shell:
+            cmd: |
+              set -eu
+              umask 077
+              temp=$(mktemp /etc/oauth2-proxy/credentials/.cookie-secret.XXXXXX)
+              trap 'rm -f "$temp"' EXIT
+              openssl rand -out "$temp" 32
+              ln "$temp" /etc/oauth2-proxy/credentials/cookie-secret
+            creates: /etc/oauth2-proxy/credentials/cookie-secret
+
+        - name: Seed the Polis Google login allowlist if missing
+          ansible.builtin.copy:
+            content: "{{ polis_initial_email }}\n"
+            dest: /etc/oauth2-proxy/credentials/allowed-emails
+            force: false
+            owner: root
+            group: root
+            mode: "0600"
+          notify: Restart Polis OAuth2 Proxy
+
+        - name: Install the Polis OAuth2 Proxy configuration
+          ansible.builtin.template:
+            src: polis-oauth2-proxy.cfg.j2
+            dest: /etc/oauth2-proxy/polis.cfg
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Restart Polis OAuth2 Proxy
+
+        - name: Install the Polis OAuth2 Proxy service
+          ansible.builtin.copy:
+            src: files/polis-oauth2-proxy.service
+            dest: /etc/systemd/system/polis-oauth2-proxy.service
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Restart Polis OAuth2 Proxy
+
+        - name: Check for Google OAuth client credentials
+          ansible.builtin.stat:
+            path: "/etc/oauth2-proxy/credentials/{{ item }}"
+            get_checksum: false
+          loop:
+            - google.env
+            - google-client-secret
+          register: polis_google_credentials
+
+        - name: Determine whether Google credentials are ready
+          ansible.builtin.set_fact:
+            polis_oauth2_ready: "{{ polis_google_credentials.results | selectattr('stat.exists') | selectattr('stat.size', 'gt', 0) | list | length == 2 }}"
+
+        - name: Start OAuth2 Proxy when Google credentials are ready
+          ansible.builtin.systemd_service:
+            name: polis-oauth2-proxy.service
+            daemon_reload: true
+            enabled: "{{ polis_oauth2_ready }}"
+            state: "{{ 'started' if polis_oauth2_ready else 'stopped' }}"
+
+        - name: Check that OAuth2 Proxy is listening before routing traffic
+          ansible.builtin.uri:
+            url: http://127.0.0.1:4180/ping
+            use_proxy: false
+          register: polis_oauth2_health
+          until: polis_oauth2_health.status == 200
+          retries: 5
+          delay: 1
+          when: polis_oauth2_ready
+
+        - name: Configure the Polis HTTPS location
+          ansible.builtin.copy:
+            dest: /etc/nginx/snippets/polis-https-location.conf
+            content: |
+              {% if polis_oauth2_ready %}
+              proxy_pass http://127.0.0.1:4180;
+              proxy_set_header Host $server_name;
+              proxy_set_header X-Forwarded-Host $server_name;
+              proxy_set_header X-Forwarded-Proto $scheme;
+              proxy_set_header X-Forwarded-Uri $request_uri;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $remote_addr;
+              proxy_set_header X-Forwarded-Email "";
+              proxy_set_header X-Forwarded-User "";
+              {% else %}
+              default_type text/plain;
+              return 200 "Hello, world!\n";
+              {% endif %}
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Apply nginx configuration
+
+    - name: Install the Polis HTTPS site
+      ansible.builtin.template:
+        src: polis-nginx-https.conf.j2
+        dest: /etc/nginx/sites-available/polis-https
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Apply nginx configuration
+
+    - name: Enable the Polis HTTPS site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/polis-https
+        dest: /etc/nginx/sites-enabled/polis-https
+        state: link
+      notify: Apply nginx configuration
+
+    - name: Create the Certbot deploy hook directory
+      ansible.builtin.file:
+        path: /etc/letsencrypt/renewal-hooks/deploy
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Reload nginx after Certbot renews a certificate
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx
+        content: |
+          #!/bin/sh
+          exec /usr/bin/systemctl reload nginx
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Enable automatic certificate renewal
+      ansible.builtin.systemd_service:
+        name: certbot.timer
+        enabled: true
+        state: started
+
+  handlers:
+    - name: Restart Polis OAuth2 Proxy
+      ansible.builtin.systemd_service:
+        name: polis-oauth2-proxy.service
+        daemon_reload: true
+        state: restarted
+      when: polis_oauth2_ready
+
+    - name: Validate nginx configuration
+      ansible.builtin.command: /usr/sbin/nginx -t
+      changed_when: false
+      listen: Apply nginx configuration
+
+    - name: Reload nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded
+      listen: Apply nginx configuration

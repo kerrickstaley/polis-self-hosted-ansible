@@ -1,0 +1,101 @@
+diff --git a/client-admin/src/components/landers/SignIn.js b/client-admin/src/components/landers/SignIn.js
+index 776fd2c..bfab8d9 100644
+--- a/client-admin/src/components/landers/SignIn.js
++++ b/client-admin/src/components/landers/SignIn.js
+@@ -1,6 +1,7 @@
+ // Copyright (C) 2012-present, The Authors. This program is free software: you can redistribute it and/or  modify it under the terms of the GNU Affero General Public License, version 3, as published by the Free Software Foundation. This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public License for more details. You should have received a copy of the GNU Affero General Public License along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ import PropTypes from 'prop-types'
++import { useCallback, useEffect, useRef } from 'react'
+ import { Navigate } from 'react-router'
+ import { Heading, Box, Button } from 'theme-ui'
+ import StaticLayout from './lander-layout'
+@@ -8,7 +9,16 @@ import StaticLayout from './lander-layout'
+ import { useAuth } from 'react-oidc-context'
+ 
+ const SignIn = ({ authed }) => {
+-  const auth = useAuth()
++  const { signinRedirect, isLoading, activeNavigator, error } = useAuth()
++  const started = useRef(false)
++
++  const signIn = useCallback(() => signinRedirect({ state: { returnTo: '/' } }), [signinRedirect])
++
++  useEffect(() => {
++    if (authed || isLoading || activeNavigator || error || started.current) return
++    started.current = true
++    void signIn()
++  }, [authed, isLoading, activeNavigator, error, signIn])
+ 
+   const drawLoginForm = () => {
+     return (
+@@ -16,12 +26,8 @@ const SignIn = ({ authed }) => {
+         <Button
+           sx={{ my: [2] }}
+           id="signinButton"
+-          onClick={() =>
+-            auth.signinRedirect({
+-              state: { returnTo: window.location.pathname }
+-            })
+-          }>
+-          Sign In
++          onClick={signIn}>
++          Retry sign-in
+         </Button>
+       </Box>
+     )
+@@ -37,7 +43,7 @@ const SignIn = ({ authed }) => {
+         <Heading as="h1" sx={{ my: [4, null, 5], fontSize: [6, null, 7] }}>
+           Sign In
+         </Heading>
+-        {drawLoginForm()}
++        {error ? drawLoginForm() : <p role="status">Signing in…</p>}
+       </Box>
+     </StaticLayout>
+   )
+diff --git a/client-admin/src/components/landers/SignOut.js b/client-admin/src/components/landers/SignOut.js
+index a51e6d1..3ac7573 100644
+--- a/client-admin/src/components/landers/SignOut.js
++++ b/client-admin/src/components/landers/SignOut.js
+@@ -13,7 +13,7 @@ const SignOut = () => {
+ 
+   useEffect(() => {
+     const performSignout = async () => {
+-      if (isSigningOut || error) return
++      if (auth.isLoading || isSigningOut || error) return
+ 
+       try {
+         setIsSigningOut(true)
+@@ -28,31 +28,11 @@ const SignOut = () => {
+ 
+         // Always try to remove user locally first
+         await auth.removeUser()
+-
+-        // The OIDC simulator does not include "end_session_endpoint" in the discovery document,
+-        // so we need to handle signout manually for dev environment
+-        if (process.env.AUTH_CLIENT_ID === 'dev-client-id') {
+-          // For dev environment, just redirect after local cleanup
+-          window.location.href = '/home2'
+-        } else {
+-          // For production, try the proper signout redirect
+-          try {
+-            await auth.signoutRedirect({
+-              post_logout_redirect_uri: `${window.location.origin}/home2`
+-            })
+-          } catch {
+-            // If signout redirect fails, fallback to manual redirect
+-            window.location.href = '/home2'
+-          }
+-        }
+       } catch (err) {
+         console.error('Signout error:', err)
+         setError(err.message || 'Signout failed')
+-
+-        // Force redirect to home page after a delay
+-        setTimeout(() => {
+-          window.location.href = '/home2'
+-        }, 1500)
++      } finally {
++        window.location.replace('/oauth2/sign_out?rd=%2Foauth2%2Fstart')
+       }
+     }
+ 

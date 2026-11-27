@@ -1,0 +1,9 @@
+[project]
+name = "polis-self-hosted-ansible"
+version = "0.1.0"
+description = "Deploy a self-hosted Polis instance with Ansible"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "ansible>=10,<11",
+]
